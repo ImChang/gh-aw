@@ -2286,6 +2286,58 @@ Safe Outputs Job:
 └──────────────────────────────────────────────────────────────┘
 ```
 
+### Known Limitations: Encoding-Based Evasion
+
+A sophisticated attacker (or a manipulated agent) could attempt to encode secrets (base64, hex, etc.) before committing or exfiltrating them. The project has multiple mitigations but no single deterministic defense covers all encoding scenarios.
+
+#### What IS protected against
+
+**1. Bash encoding tools are not available.** The agent's bash tool is restricted to an explicit allowlist that does **not** include `base64`, `xxd`, `hexdump`, `openssl`, or any encoding utilities:
+
+```go
+// File: pkg/constants/constants.go
+var DefaultBashTools = []string{
+    "echo", "ls", "pwd", "cat", "head", "tail",
+    "grep", "wc", "sort", "uniq", "date", "yq",
+}
+```
+
+This is the primary defense — the agent cannot trivially run `echo $SECRET | base64`.
+
+**2. Threat detection AI explicitly checks for encoded payloads.** The threat detection prompt instructs the reviewer to look for:
+
+> "Base64, hex, or other encoded strings that appear to hide secrets, commands, or malicious payloads without legitimate purpose"
+
+This provides a probabilistic catch for encoded content in agent outputs and patches.
+
+**3. Markdown security scanner detects encoding patterns** in imported workflows:
+- Large base64 payloads: `[A-Za-z0-9+/]{200,}={0,2}`
+- Hex sequences: repeated `\x[0-9a-fA-F]{2}` patterns (20+ occurrences)
+- Decode-and-execute: `base64 -d | bash`, `atob.*eval`
+
+**4. Network sandboxing prevents exfiltration.** Even if the agent encodes a secret, the firewall blocks outbound connections to non-allowed domains. SSL Bump (optional) enables HTTPS content inspection for URL path filtering.
+
+**5. Protected files and allowed files policies** on `push_to_pull_request_branch` restrict which files can be modified in patches.
+
+#### What is NOT fully protected against
+
+**1. Language-runtime encoding.** If the agent has access to a programming language runtime (Python, Node.js, etc.), it could use built-in encoding functions (`import base64; base64.b64encode(...)`) that bypass the bash tool restriction. The bash allowlist doesn't restrict what happens inside language interpreters.
+
+**2. Pattern-based redaction bypass.** The runtime redaction system (Layer 3) scans for **known credential patterns** and **exact string matches**. A base64-encoded secret no longer matches either — `ghp_abc123...` encoded as `Z2hwX2FiYzEyMy4uLg==` would not be caught by pattern matching.
+
+**3. AI threat detection is probabilistic.** The threat detection layer uses an AI model to review outputs, which is effective but not deterministic. A well-crafted encoding scheme (e.g., splitting the encoded value across multiple files, or using a custom alphabet) could evade detection.
+
+**4. No pre-commit secret scanning hooks.** The project does not use tools like git-secrets, truffleHog, or gitleaks as pre-commit/pre-push hooks that would scan committed content for high-entropy strings or known secret patterns.
+
+#### Recommendations for replication
+
+If implementing this architecture in a project where encoding evasion is a concern:
+
+1. **Add a deterministic secret scanner** (truffleHog, gitleaks, or detect-secrets) as a post-processing step on all patches before they are committed. These tools detect high-entropy strings regardless of format.
+2. **Restrict language runtime access** where possible — if the agent doesn't need Python, don't provide it.
+3. **Monitor for encoding function calls** in agent logs and tool usage (e.g., flag calls to `btoa`, `base64`, `Buffer.from` in the audit system).
+4. **Implement content-aware diffing** — compare the information-theoretic entropy of patch content against baseline; high-entropy blobs in unexpected locations may indicate encoded secrets.
+
 ---
 
 ## Summary: Replication Checklist
