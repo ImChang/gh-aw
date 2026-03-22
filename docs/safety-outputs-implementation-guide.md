@@ -26,6 +26,7 @@
 20. [Staged Mode (Dry-Run Previews)](#20-staged-mode-dry-run-previews)
 21. [Guard Policies](#21-guard-policies)
 22. [MCP Logs Guardrail](#22-mcp-logs-guardrail)
+23. [Secret Leak Prevention](#23-secret-leak-prevention)
 
 ---
 
@@ -2006,6 +2007,287 @@ This tells the agent how to narrow its query rather than failing silently or con
 
 ---
 
+## 23. Secret Leak Prevention
+
+The project implements a comprehensive, multi-layered approach to preventing environment secrets from leaking into agent containers, output files, logs, or artifacts. The defense spans compile-time detection, runtime redaction, and architectural isolation.
+
+### Layer 1: Compile-Time Secret Detection in `env`
+
+**File**: `pkg/workflow/strict_mode_env_validation.go`
+
+The compiler scans the frontmatter `env` and `engine.env` sections for any secret references. This catches secrets that would be exposed to the agent container.
+
+```go
+func (c *Compiler) validateEnvSecrets(frontmatter map[string]any) error {
+    // Check top-level env section (no secret overrides allowed)
+    if err := c.validateEnvSecretsSection(frontmatter, "env", nil); err != nil {
+        return err
+    }
+
+    // Check engine.env section (with engine-specific allowlist)
+    if engineValue, exists := frontmatter["engine"]; exists {
+        if engineObj, ok := engineValue.(map[string]any); ok {
+            allowedEnvVarKeys := c.getEngineBaseEnvVarKeys(engineSetting)
+            if err := c.validateEnvSecretsSection(engineObj, "engine.env", allowedEnvVarKeys); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+```
+
+**Detection patterns** — catches all these forms:
+
+```yaml
+env:
+  SIMPLE: "${{ secrets.TOKEN }}"                          # Direct secret
+  EMBEDDED: "Bearer ${{ secrets.TOKEN }}"                 # Embedded in string
+  SUB_EXPR: "${{ github.workflow && secrets.TOKEN }}"      # Sub-expression
+  FALLBACK: "${{ secrets.DB_PASSWORD || env.DEFAULT }}"    # With fallback
+  NESTED: "${{ (github.actor || secrets.HIDDEN) }}"        # Nested in parens
+```
+
+**Enforcement levels:**
+- **Strict mode**: Error — compilation fails
+- **Non-strict mode**: Warning — compilation succeeds with a warning
+
+**Engine-specific allowlist:** Engine env vars (like `COPILOT_GITHUB_TOKEN`) are allowed to carry secrets in `engine.env` because they're required by the engine itself. The allowlist is built dynamically from the engine's `GetRequiredSecretNames()` and auth definition:
+
+```go
+func (c *Compiler) getEngineBaseEnvVarKeys(engineID string) map[string]bool {
+    engine, _ := c.engineRegistry.GetEngine(engineID)
+    keys := make(map[string]bool)
+    for _, name := range engine.GetRequiredSecretNames(minimalData) {
+        keys[name] = true // e.g., "COPILOT_GITHUB_TOKEN"
+    }
+    // Also include auth-definition secrets for inline engines
+    if def := c.engineCatalog.Get(engineID); def != nil && def.Provider.Auth != nil {
+        for _, name := range def.Provider.Auth.RequiredSecretNames() {
+            keys[name] = true
+        }
+    }
+    return keys
+}
+```
+
+### Layer 2: Secret Extraction Library
+
+**File**: `pkg/workflow/secret_extraction.go`
+
+A reusable library for extracting and cataloging all secret references from workflow content:
+
+```go
+// Extract a single secret name
+ExtractSecretName("${{ secrets.DD_API_KEY }}") // → "DD_API_KEY"
+
+// Extract all secrets from a value (handles sub-expressions)
+ExtractSecretsFromValue("${{ github.workflow && secrets.TOKEN }}")
+// → {"TOKEN": "${{ github.workflow && secrets.TOKEN }}"}
+
+// Extract from an entire env map
+ExtractSecretsFromMap(map[string]string{
+    "DD_API_KEY": "${{ secrets.DD_API_KEY }}",
+    "DD_SITE":    "${{ secrets.DD_SITE || 'datadoghq.com' }}",
+})
+// → {"DD_API_KEY": "${{ secrets.DD_API_KEY }}", "DD_SITE": "${{ secrets.DD_SITE || 'datadoghq.com' }}"}
+
+// Replace secret expressions with safe env var references
+ReplaceSecretsWithEnvVars(value) // → converts ${{ secrets.X }} to $X
+```
+
+The pattern matches `${{ secrets.SECRET_NAME }}` with optional fallbacks, and handles secrets embedded in larger expressions.
+
+### Layer 3: MCP API Key Immediate Masking
+
+**File**: `pkg/workflow/mcp_setup_generator.go`
+
+API keys generated at runtime for the MCP gateway, safe outputs server, and MCP scripts are masked **immediately** after generation — no timing window where the value is exposed in logs:
+
+```bash
+# Generated in compiled workflow YAML:
+# Generate a secure random API key (360 bits of entropy, 40+ chars)
+# Mask immediately to prevent timing vulnerabilities
+API_KEY=$(openssl rand -base64 45 | tr -d '/+=')
+echo "::add-mask::${API_KEY}"    # ← Masked BEFORE any other use
+```
+
+This pattern is applied in three places:
+1. Safe Outputs MCP server API key
+2. MCP Scripts API key
+3. MCP Gateway API key
+
+**Tested by**: `pkg/workflow/mcp_api_key_masking_test.go` — verifies:
+- Immediate masking after generation (no gap)
+- No empty variable declarations before assignment
+- Consistent pattern across all three API key types
+
+### Layer 4: Runtime Secret Redaction from Output Files
+
+**Files**: `pkg/workflow/redact_secrets.go` (Go) + `actions/setup/js/redact_secrets.cjs` (JS)
+
+A two-part system that scans and redacts secrets from all output files before artifact upload.
+
+**Go side** — scans the compiled YAML for `secrets.([A-Z][A-Z0-9_]*)` patterns and generates a GitHub Actions step that:
+1. Passes secret names as `GH_AW_SECRET_NAMES` env var
+2. Passes actual secret values as individual env vars (for exact-match redaction)
+
+```go
+func (c *Compiler) generateSecretRedactionStep(yaml *strings.Builder, yamlContent string, data *WorkflowData) {
+    secretReferences := CollectSecretReferences(yamlContent)
+
+    // Always generate the step (even if no-op) for consistent step ordering
+    if len(secretReferences) == 0 {
+        // No-op step
+        yaml.WriteString("      - name: Redact secrets in logs\n")
+        yaml.WriteString("        if: always()\n")
+        yaml.WriteString("        run: echo 'No secrets to redact'\n")
+    } else {
+        // Full redaction step with secret values as env vars
+    }
+}
+```
+
+**JS side** — processes all files under `/tmp/gh-aw` and `$RUNNER_TEMP/gh-aw`:
+
+```javascript
+// File: actions/setup/js/redact_secrets.cjs
+
+// File types scanned:
+const TARGET_EXTENSIONS = ['.txt', '.json', '.log', '.md', '.mdx', '.yml', '.jsonl'];
+
+// Two-pass redaction:
+// 1. Built-in pattern detection (15+ credential types)
+// 2. Custom secret exact-match redaction
+function processFile(filePath, secretValues) {
+    const content = fs.readFileSync(filePath, "utf8");
+
+    // Pass 1: Built-in pattern detection
+    const builtInResult = redactBuiltInPatterns(content);
+
+    // Pass 2: Custom secret exact-match
+    const customResult = redactSecrets(builtInResult.content, secretValues);
+
+    if (totalRedactions > 0) {
+        fs.writeFileSync(filePath, finalContent, "utf8");
+    }
+}
+```
+
+**Built-in credential patterns** (automatically detected even without explicit secret references):
+
+| Provider | Token Type | Pattern |
+|----------|-----------|---------|
+| GitHub | Personal Access Token (classic) | `ghp_[0-9a-zA-Z]{36}` |
+| GitHub | Server-to-Server Token | `ghs_[0-9a-zA-Z]{36}` |
+| GitHub | OAuth Access Token | `gho_[0-9a-zA-Z]{36}` |
+| GitHub | User Access Token | `ghu_[0-9a-zA-Z]{36}` |
+| GitHub | Fine-grained PAT | `github_pat_[0-9a-zA-Z_]{82}` |
+| GitHub | Refresh Token | `ghr_[0-9a-zA-Z]{36}` |
+| Azure | Storage Account Key | `AccountKey=[a-zA-Z0-9+/]{86}==` |
+| Azure | SAS Token | `?sv=...&sig=...` |
+| Google | API Key | `AIzaSy[0-9A-Za-z_-]{33}` |
+| Google | OAuth Access Token | `ya29.[0-9A-Za-z_-]{1,800}` |
+| AWS | Access Key ID | `AKIA[0-9A-Z]{16}` |
+| OpenAI | API Key | `sk-[a-zA-Z0-9]{48}` |
+| OpenAI | Project API Key | `sk-proj-[a-zA-Z0-9]{48,64}` |
+| Anthropic | API Key | `sk-ant-api03-[a-zA-Z0-9_-]{95}` |
+
+**Custom secret redaction** uses exact string matching (not regex) to avoid interpreting special characters. Secrets shorter than 6 characters are skipped to prevent false positives. All redactions use the fixed-length string `***REDACTED***`.
+
+```javascript
+function redactSecrets(content, secretValues) {
+    // Sort by length (longest first) to handle overlapping secrets
+    const sortedSecrets = secretValues.slice().sort((a, b) => b.length - a.length);
+    for (const secretValue of sortedSecrets) {
+        if (!secretValue || secretValue.length < 6) continue; // Skip short values
+        // Exact string matching via split/join (safe, no regex interpretation)
+        const parts = redacted.split(secretValue);
+        redacted = parts.join("***REDACTED***");
+    }
+}
+```
+
+### Layer 5: Custom Secret Masking Steps
+
+**File**: `pkg/workflow/secret_masking.go`
+
+Workflow authors can define custom masking steps in frontmatter for secrets that don't follow standard patterns:
+
+```yaml
+---
+secret-masking:
+  steps:
+    - name: Mask custom secrets
+      run: |
+        echo "::add-mask::$(cat /tmp/my-custom-secret)"
+---
+```
+
+Custom masking steps are:
+- Extracted from frontmatter via `extractSecretMaskingConfig()`
+- Merged from imports via `MergeSecretMasking()`
+- Injected into the compiled workflow before the agent runs
+
+### Layer 6: Jobs Secrets Expression Validation
+
+**File**: `pkg/workflow/secrets_validation.go`
+
+When workflows pass secrets to reusable workflows via `jobs.*.secrets`, the expressions are validated against a strict pattern:
+
+```go
+// Only allows: ${{ secrets.NAME }} or ${{ secrets.A || secrets.B }}
+var pattern = regexp.MustCompile(
+    `^\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*` +
+    `(\s*\|\|\s*secrets\.[A-Za-z_][A-Za-z0-9_]*)*\s*\}\}$`)
+```
+
+This prevents accidentally passing plaintext values or env var references where secrets are expected. Importantly, validation error messages don't log secret names (CodeQL protection).
+
+### Layer 7: Architectural Isolation
+
+The fundamental architectural defense: the agent job **never receives write tokens**. Secrets only flow to the safe-outputs job, which has scoped permissions computed at compile time (see [Section 5](#5-least-privilege-permission-computation)).
+
+```
+Agent Job:
+  - Read-only permissions
+  - No access to write tokens
+  - Sandboxed with network firewall
+  - Output goes to JSONL file
+
+Safe Outputs Job:
+  - Scoped write token (minimal permissions)
+  - Processes validated/sanitized JSONL
+  - Secrets flow HERE, not to agent
+```
+
+### Defense-in-Depth Summary
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Layer 1: Compile-Time Detection                               │
+│   ├── Detect secrets in env section (strict=error, else warn) │
+│   ├── Engine-specific allowlist for required secrets           │
+│   └── Jobs secrets expression validation                      │
+├──────────────────────────────────────────────────────────────┤
+│ Layer 2: Immediate Runtime Masking                            │
+│   ├── MCP API keys masked instantly (::add-mask::)            │
+│   └── Custom masking steps from frontmatter                   │
+├──────────────────────────────────────────────────────────────┤
+│ Layer 3: Output File Redaction (before artifact upload)       │
+│   ├── Built-in pattern detection (15+ credential formats)     │
+│   ├── Custom secret exact-match redaction                     │
+│   └── Scans .txt, .json, .log, .md, .yml, .jsonl files       │
+├──────────────────────────────────────────────────────────────┤
+│ Layer 4: Architectural Isolation                              │
+│   ├── Agent job is read-only (no write tokens)                │
+│   ├── Secrets only flow to safe-outputs job                   │
+│   └── Network sandboxing prevents exfiltration                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Summary: Replication Checklist
 
 To replicate this safety architecture in another project, implement these layers in order of priority:
@@ -2026,13 +2308,17 @@ To replicate this safety architecture in another project, implement these layers
 9. **Dangerous permissions enforcement**: Block write permissions on agent job
 10. **Supply chain security**: Pin action SHAs, not mutable tags
 
+### Should-Have (continued)
+
+11. **Secret leak prevention**: Compile-time detection, runtime redaction, built-in credential pattern matching, immediate API key masking
+
 ### Nice-to-Have (Production Hardening)
 
-11. **Staged mode**: Dry-run preview without side effects
-12. **Threat detection**: AI-based review of agent outputs before execution
-13. **DIFC**: Integrity and secrecy labels with gateway enforcement
-14. **Strict mode**: Production hardening with zero-tolerance for violations
-15. **Markdown security scanning**: Detect malicious content in imported workflows
-16. **Audit & compliance**: Comprehensive logging and reporting
-17. **MCP logs guardrail**: Prevent context window overflow from large outputs
-18. **Guard policies**: Fine-grained MCP gateway access control
+12. **Staged mode**: Dry-run preview without side effects
+13. **Threat detection**: AI-based review of agent outputs before execution
+14. **DIFC**: Integrity and secrecy labels with gateway enforcement
+15. **Strict mode**: Production hardening with zero-tolerance for violations
+16. **Markdown security scanning**: Detect malicious content in imported workflows
+17. **Audit & compliance**: Comprehensive logging and reporting
+18. **MCP logs guardrail**: Prevent context window overflow from large outputs
+19. **Guard policies**: Fine-grained MCP gateway access control
